@@ -2,10 +2,11 @@ smartty_resolve_history_file() {
     local histfile
 
     for histfile in \
+        "$HISTFILE" \
         "$HOME/.config/zsh/histfile" \
         "$HOME/.zsh_history" \
         "$HOME/.zhistory"; do
-        [[ -f "$histfile" ]] && print -r -- "$histfile" && return 0
+        [[ -n "$histfile" && -f "$histfile" ]] && print -r -- "$histfile" && return 0
     done
 
     return 1
@@ -14,7 +15,7 @@ smartty_resolve_history_file() {
 smartty_extract_history_command() {
     local line="$1"
 
-    if [[ $line == ": "* ]]; then
+    if [[ $line == ": "<->":"<->";"* ]]; then
         print -r -- "${line#*;}"
     else
         print -r -- "$line"
@@ -28,44 +29,81 @@ smartty_sanitize_base_command() {
     print -r -- "$base_cmd"
 }
 
-smartty_remember_command() {
+smartty_index_command() {
+    setopt localoptions extendedglob
     local cmd="$1"
 
-    [[ -n ${SMARTTY_SEEN_COMMANDS[$cmd]} ]] && return 0
+    cmd=${cmd##[[:space:]]#}
+    cmd=${cmd%%[[:space:]]#}
+    [[ -z "$cmd" ]] && return 1
 
-    SMARTTY_SEEN_COMMANDS[$cmd]=1
-    SMARTTY_COMMANDS+=("$cmd")
+    local base_cmd=${cmd%% *}
+    base_cmd=${base_cmd//[^a-zA-Z0-9_-]/}
+
+    (( SMARTTY_HISTORY_CLOCK++ ))
+
+    if [[ -n "$base_cmd" ]]; then
+        SMARTTY_COMMAND_FREQ[$base_cmd]=$(( ${SMARTTY_COMMAND_FREQ[$base_cmd]:-0} + 1 ))
+    fi
+
+    # Multiline commands can't render as inline ghost text; count them but don't suggest.
+    [[ $cmd == *$'\n'* ]] && return 0
+
+    SMARTTY_CMD_COUNT[$cmd]=$(( ${SMARTTY_CMD_COUNT[$cmd]:-0} + 1 ))
+    SMARTTY_CMD_LAST[$cmd]=$SMARTTY_HISTORY_CLOCK
+
+    if [[ -z ${SMARTTY_SEEN_COMMANDS[$cmd]} ]]; then
+        SMARTTY_SEEN_COMMANDS[$cmd]=1
+        SMARTTY_COMMANDS+=("$cmd")
+    fi
+    return 0
 }
 
 smartty_load_history() {
+    local quiet=0
+    [[ "$1" == "-q" ]] && quiet=1
+
     local histfile
     histfile=$(smartty_resolve_history_file) || {
-        print -r -- "History file not found"
+        (( quiet )) || print -r -- "History file not found"
         return 1
     }
 
-    print -r -- "Loading history from: $histfile"
+    (( quiet )) || print -r -- "Loading history from: $histfile"
 
-    local line cmd base_cmd
     SMARTTY_COMMAND_FREQ=()
+    SMARTTY_CMD_COUNT=()
+    SMARTTY_CMD_LAST=()
     SMARTTY_SEEN_COMMANDS=()
     SMARTTY_COMMANDS=()
+    SMARTTY_HISTORY_CLOCK=0
 
-    while IFS= read -r line; do
-        if [[ $line == ": "* ]]; then
-            cmd=${line#*;}
-        else
-            cmd=$line
-        fi
-        [[ -z "$cmd" ]] && continue
+    local -a lines
+    lines=("${(@f)$(<"$histfile")}") 2>/dev/null
+    (( ${#lines} > SMARTTY_HISTORY_MAX )) && lines=("${(@)lines[-SMARTTY_HISTORY_MAX,-1]}")
 
-        base_cmd=${cmd%% *}
-        base_cmd=${base_cmd//[^a-zA-Z0-9_-]/}
-        [[ -z "$base_cmd" ]] && continue
+    local entry
+    local metachar=$'\x83'
+    local -i i=1 total=${#lines}
 
-        (( SMARTTY_COMMAND_FREQ[$base_cmd]++ ))
-        smartty_remember_command "$cmd"
-    done < "$histfile"
+    while (( i <= total )); do
+        entry=${lines[i]}
+        (( i++ ))
 
-    print -r -- "Loaded ${#SMARTTY_COMMAND_FREQ[@]} unique commands and ${#SMARTTY_COMMANDS[@]} suggestions"
+        # Continuation lines: zsh writes embedded newlines as backslash-newline.
+        while [[ $entry == *\\ ]] && (( i <= total )); do
+            entry=${entry%\\}$'\n'${lines[i]}
+            (( i++ ))
+        done
+
+        [[ $entry == ": "<->":"<->";"* ]] && entry=${entry#*;}
+        # Skip entries with metafied (non-ASCII) bytes we can't decode.
+        [[ $entry == *$metachar* ]] && continue
+
+        smartty_index_command "$entry"
+    done
+
+    SMARTTY_LOADED=1
+    (( quiet )) || print -r -- "Loaded ${#SMARTTY_COMMANDS[@]} unique commands (${#SMARTTY_COMMAND_FREQ[@]} distinct programs)"
+    return 0
 }
